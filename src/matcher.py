@@ -17,6 +17,16 @@ _CONTEXT_WINDOW = 90
 
 DEFAULT_FREE_DEAL_WORD = "sold"
 
+# Daniel headlines every giveaway with some variant of "WatchLink Daily Deal".
+_DAILY_DEAL_HEADER = re.compile(r"watch\s*link\s+daily\s+deal", re.IGNORECASE)
+# Free-price tokens we've seen Daniel use in the body. Required in addition to
+# the header — together they fence out paid listings that happen to mention
+# "free shipping" or "$0 down".
+_FREE_TOKENS = re.compile(
+    r"\$0\b|\bfree\s*9+\b|\bfree\.\d+\b|\bfree\b",
+    re.IGNORECASE,
+)
+
 
 def find_giveaway_word(text: str) -> str | None:
     """Return the word to comment, or None if no giveaway pattern matches.
@@ -47,36 +57,36 @@ def find_giveaway_word(text: str) -> str | None:
 
 
 def is_free_giveaway_post(post: dict, text: str | None = None) -> bool:
-    """True iff the post payload represents a $0 listing.
+    """True iff the post payload represents a giveaway listing.
 
-    Used as a fallback for Daniel's free-watch giveaway series (e.g., the 8x
-    Free Seiko Daily Deals starting with the SSK033 GMT) where the listing is
-    posted at $0 with no explicit "first to comment X" word — the convention
-    is that whoever comments first wins.
+    Daniel's giveaway series is inconsistent in how price is expressed, so
+    detection is layered:
 
-    Detection is layered because the API is inconsistent:
-      1. price == 0 (any numeric form) — direct case.
-      2. price == null + body text contains "$0" + post has structured
-         listing metadata (brand set, category=buy_sell). This was the actual
-         SSK033 drop on 2026-05-04: post 1548 had price=null and "$0 +
-         shipping" only in the body. The structural guard (brand non-null)
-         distinguishes a real listing from an announcement post that just
-         mentions $0 in passing — the announcement (post 1448) had brand=null.
+      1. price == 0 (any numeric form) — the listing form was filled with $0
+         (e.g., the SRPJ13 drop on 2026-05-12).
+      2. "WatchLink Daily Deal" header + any free token in a buy_sell post —
+         covers slang wording like "Free99 + shipping" (5/13/26) where price
+         is null and the body never contains the literal "$0".
+      3. price == null + body contains "$0" + brand set + buy_sell category —
+         the announcement-style SSK033 drop on 2026-05-04 (post 1548); the
+         brand guard distinguishes a real listing from an announcement that
+         mentions $0 in passing (post 1448 had brand=null).
     """
     if _is_zero_numeric_price(_extract_price(post)):
         return True
 
     if text is None:
         return False
-    if "$0" not in text:
-        return False
-    # Structural check: real $0 listings carry brand + buy_sell category;
-    # announcement posts that mention "$0" in passing do not.
-    if not post.get("brand"):
-        return False
     if post.get("category") != "buy_sell":
         return False
-    return True
+
+    if _DAILY_DEAL_HEADER.search(text) and _FREE_TOKENS.search(text):
+        return True
+
+    if "$0" in text and post.get("brand"):
+        return True
+
+    return False
 
 
 def _is_zero_numeric_price(price: Any) -> bool:
