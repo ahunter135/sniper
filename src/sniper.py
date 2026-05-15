@@ -29,7 +29,13 @@ from pathlib import Path
 import httpx
 
 from api import AuthExpired, WatchlinkClient, comments_count, extract_text
-from matcher import DEFAULT_FREE_DEAL_WORD, find_giveaway_word, is_free_giveaway_post
+from matcher import (
+    DAILY_DEAL_HEADER,
+    DEFAULT_FREE_DEAL_WORD,
+    find_giveaway_word,
+    is_free_giveaway_post,
+)
+from solver import solve_giveaway
 
 BASE = Path(__file__).resolve().parent.parent
 
@@ -129,6 +135,19 @@ def _consider_post(client: WatchlinkClient, post: dict, source: str,
     word = find_giveaway_word(text) if text else None
 
     is_daniel = _is_daniel_post(post, source)
+    has_daily_deal_header = bool(text) and bool(DAILY_DEAL_HEADER.search(text))
+
+    # Math-puzzle tier: Daniel's 5/14/26 deal swapped "first to comment X" for
+    # "first to solve this math problem." Tries safe local arithmetic first,
+    # then an Anthropic Haiku call if ANTHROPIC_API_KEY is set in .env. Runs
+    # BEFORE the free-deal tier because math posts often contain the word
+    # "free" (e.g. "...gets this Seiko for free") which would otherwise
+    # mis-fire as a "sold" comment.
+    if not word and is_daniel and has_daily_deal_header:
+        answer = solve_giveaway(text)
+        if answer:
+            word = answer
+            log.info(f"MATH-PUZZLE post={post_id} → {word!r}")
 
     # Fallback: Daniel's "Free Seiko Daily Deal" series (SSK033 GMT, etc.)
     # is listed at $0 without an explicit "first to comment X" phrase. When

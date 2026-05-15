@@ -18,7 +18,7 @@ _CONTEXT_WINDOW = 90
 DEFAULT_FREE_DEAL_WORD = "sold"
 
 # Daniel headlines every giveaway with some variant of "WatchLink Daily Deal".
-_DAILY_DEAL_HEADER = re.compile(r"watch\s*link\s+daily\s+deal", re.IGNORECASE)
+DAILY_DEAL_HEADER = re.compile(r"watch\s*link\s+daily\s+deal", re.IGNORECASE)
 # Free-price tokens we've seen Daniel use in the body. Required in addition to
 # the header — together they fence out paid listings that happen to mention
 # "free shipping" or "$0 down".
@@ -77,13 +77,19 @@ def is_free_giveaway_post(post: dict, text: str | None = None) -> bool:
 
     if text is None:
         return False
-    if post.get("category") != "buy_sell":
-        return False
 
-    if _DAILY_DEAL_HEADER.search(text) and _FREE_TOKENS.search(text):
+    # Daily Deal header + free token → giveaway regardless of category.
+    # Daniel posted the 5/14/26 deal under "discussion", not "buy_sell".
+    if DAILY_DEAL_HEADER.search(text) and _FREE_TOKENS.search(text):
         return True
 
-    if "$0" in text and post.get("brand"):
+    # Legacy path for posts without the header: $0 in body + brand set +
+    # buy_sell. The brand+category guards filter announcement posts.
+    if (
+        "$0" in text
+        and post.get("brand")
+        and post.get("category") == "buy_sell"
+    ):
         return True
 
     return False
