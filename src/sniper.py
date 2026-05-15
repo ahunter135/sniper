@@ -52,14 +52,17 @@ LOG_FILE = BASE / "logs" / "sniper.log"
 
 MAX_POSTS_PER_SCAN = 20
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s %(message)s",
-    handlers=[
-        logging.FileHandler(LOG_FILE),
-        logging.StreamHandler(sys.stdout),
-    ],
-)
+_console = logging.StreamHandler(sys.stdout)
+_console.setFormatter(logging.Formatter("%(asctime)s %(message)s", datefmt="%H:%M:%S"))
+_file = logging.FileHandler(LOG_FILE)
+_file.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
+logging.basicConfig(level=logging.INFO, handlers=[_console, _file])
+
+# httpx logs every request at INFO; at 2s polling that's the loudest noise in
+# the terminal. Demote third-party HTTP loggers; we still capture failures.
+for _noisy in ("httpx", "httpcore"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
+
 log = logging.getLogger("sniper")
 
 
@@ -157,13 +160,12 @@ def _consider_post(client: WatchlinkClient, post: dict, source: str,
         word = DEFAULT_FREE_DEAL_WORD
         log.info(f"FREE-DEAL post={post_id} (Daniel, $0 listing) → defaulting to {word!r}")
 
-    # Visibility: log every Daniel post we considered, even when no match.
-    # Future drops are easier to debug if we have a record of what each post
-    # looked like (price, brand, comment count) at scan time.
-    if is_daniel and not word:
+    # DEBUG-level diagnostic: one line per unmatched Daniel post so we can
+    # reconstruct what each drop looked like at scan time. Off by default.
+    if is_daniel and not word and log.isEnabledFor(logging.DEBUG):
         brand = post.get("brand")
         brand_name = brand.get("name") if isinstance(brand, dict) else brand
-        log.info(
+        log.debug(
             f"DANIEL-POST post={post_id} category={post.get('category')!r} "
             f"brand={brand_name!r} price={post.get('price')!r} "
             f"formatted_price={post.get('formatted_price')!r} "
@@ -284,15 +286,18 @@ def run_once(armed: bool) -> None:
 
 def _scan_all(client: WatchlinkClient, armed: bool, state: dict) -> None:
     """One scan pass against the configured surfaces. No auth/refresh — the
-    caller is responsible for keeping the session warm."""
+    caller is responsible for keeping the session warm.
+
+    Deliberately silent on the happy path. The terminal stays quiet unless a
+    match, skip, post, or error happens — at 2s polling, a per-tick "scanned
+    N posts" line drowns everything else.
+    """
     posts = client.user_posts(DANIEL_USER_ID, page=1, per_page=MAX_POSTS_PER_SCAN)
-    log.info(f"Daniel's posts: {len(posts)}")
     _scan(client, posts, f"profile:{DANIEL_USER_ID}", armed, state)
 
     for cat in FEED_CATEGORIES:
         try:
             posts = client.feed(cat, page=1, per_page=MAX_POSTS_PER_SCAN)
-            log.info(f"Feed '{cat}': {len(posts)}")
             _scan(client, posts, f"feed:{cat}", armed, state)
         except Exception:
             log.exception(f"feed '{cat}' scan failed")
