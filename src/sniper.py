@@ -52,6 +52,12 @@ LOG_FILE = BASE / "logs" / "sniper.log"
 
 MAX_POSTS_PER_SCAN = 20
 
+# Optional watchlist filter. When non-empty, the bot only posts on a matched
+# post if ALL of these keywords appear (case-insensitive substring match) in
+# the post text or brand metadata. Empty list = no filter (current behavior).
+# Set at startup from --filter.
+_FILTER_KEYWORDS: list[str] = []
+
 _console = logging.StreamHandler(sys.stdout)
 _console.setFormatter(logging.Formatter("%(asctime)s %(message)s", datefmt="%H:%M:%S"))
 _file = logging.FileHandler(LOG_FILE)
@@ -121,6 +127,20 @@ def _is_daniel_post(post: dict, source: str) -> bool:
     return _post_author_id(post) == DANIEL_USER_ID
 
 
+def _post_matches_filter(post: dict, text: str | None) -> bool:
+    """True if all _FILTER_KEYWORDS appear (case-insensitive) somewhere in
+    the post text or brand metadata. Always True when the filter is empty."""
+    if not _FILTER_KEYWORDS:
+        return True
+    haystack = (text or "").lower()
+    brand = post.get("brand")
+    if isinstance(brand, dict):
+        haystack += " " + str(brand.get("name") or "").lower()
+    elif isinstance(brand, str):
+        haystack += " " + brand.lower()
+    return all(kw.lower() in haystack for kw in _FILTER_KEYWORDS)
+
+
 def _consider_post(client: WatchlinkClient, post: dict, source: str,
                    armed: bool, state: dict) -> None:
     post_id = str(post.get("id") or "")
@@ -182,6 +202,16 @@ def _consider_post(client: WatchlinkClient, post: dict, source: str,
         f"MATCH source={source} post={post_id} word={word!r} "
         f"cached_comments={cached_count} preview={text[:140]!r}"
     )
+
+    # Watchlist gate: if --filter is set, every keyword must appear in the
+    # post text or brand. Logged but not persisted to state, so changing the
+    # filter at restart re-considers previously-filtered posts.
+    if not _post_matches_filter(post, text):
+        log.info(
+            f"FILTERED post={post_id}: keywords {_FILTER_KEYWORDS!r} "
+            f"not all present in text/brand — skip"
+        )
+        return
 
     # Fast reject on cached count. The feed payload is authoritative enough
     # for a first-pass filter — if it already shows comments, we're late.
@@ -321,7 +351,10 @@ def run_loop(armed: bool, interval: int) -> None:
             log.exception("initial auth crashed")
             return
 
-        log.info(f"loop armed={armed} interval={interval}s")
+        log.info(
+            f"loop armed={armed} interval={interval}s "
+            f"filter={_FILTER_KEYWORDS or 'off'}"
+        )
         while True:
             tick_start = time.time()
             try:
@@ -376,7 +409,15 @@ def main() -> None:
                     help="actually post comments (default: dry-run logs only)")
     ap.add_argument("--interval", type=int, default=300,
                     help="seconds between runs in loop mode (default 300)")
+    ap.add_argument("--filter", type=str, default=None,
+                    help='Only act on posts whose text/brand contains ALL of '
+                         'these space-separated keywords '
+                         '(case-insensitive, order-independent). E.g. '
+                         '--filter "seiko presage". Omit for no filter.')
     args = ap.parse_args()
+
+    global _FILTER_KEYWORDS
+    _FILTER_KEYWORDS = (args.filter or "").split()
 
     if args.command == "login":
         force_login()
