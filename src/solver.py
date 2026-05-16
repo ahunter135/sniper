@@ -17,10 +17,65 @@ import logging
 import operator as op
 import os
 import re
+import time
 
 import httpx
 
 log = logging.getLogger("sniper.solver")
+
+
+def _call_claude(prompt: str, *, max_tokens: int = 80,
+                 timeout: float = 8.0, max_retries: int = 2) -> str | None:
+    """Single Claude call with retry on 429 / 5xx. Returns text or None.
+
+    Returns None when:
+      - ANTHROPIC_API_KEY is unset
+      - All retries exhausted on a transient error
+      - The response shape is unexpected
+    """
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        return None
+    for attempt in range(max_retries + 1):
+        try:
+            resp = httpx.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key": api_key,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+                json={
+                    "model": "claude-haiku-4-5-20251001",
+                    "max_tokens": max_tokens,
+                    "messages": [{"role": "user", "content": prompt}],
+                },
+                timeout=timeout,
+            )
+            if resp.status_code in (429, 500, 502, 503, 504) and attempt < max_retries:
+                retry_after = resp.headers.get("retry-after")
+                wait = float(retry_after) if retry_after else (1.5 ** attempt) + 0.5
+                log.warning(
+                    f"claude {resp.status_code}; backing off {wait:.1f}s "
+                    f"(attempt {attempt + 1}/{max_retries})"
+                )
+                time.sleep(wait)
+                continue
+            resp.raise_for_status()
+            body = resp.json()
+            for block in body.get("content", []):
+                if block.get("type") == "text":
+                    return block["text"].strip()
+            return None
+        except httpx.HTTPStatusError as e:
+            log.warning(
+                f"claude HTTP {e.response.status_code}: {e.response.text[:200]}"
+            )
+            return None
+        except Exception as e:
+            log.warning(f"claude exception: {type(e).__name__}: {e}")
+            return None
+    return None
 
 # Keywords that signal "this post wants an answer in the comments." If none
 # match, we don't bother solving — Daniel's normal "first to comment X" path
@@ -113,12 +168,8 @@ def extract_math_expression(text: str) -> str | None:
     return max(scored, key=len)
 
 
-def solve_with_llm(text: str, timeout: float = 8.0) -> str | None:
-    """Last-resort LLM call. Silently returns None unless ANTHROPIC_API_KEY
-    is set in env. Asks Claude Haiku for just the bare answer."""
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if not api_key:
-        return None
+def solve_with_llm(text: str) -> str | None:
+    """Math/riddle solver via Claude. Returns the bare answer string."""
     prompt = (
         "You are reading a watch-giveaway social media post. The first "
         "commenter with the correct answer wins. Reply with ONLY the answer "
@@ -126,29 +177,135 @@ def solve_with_llm(text: str, timeout: float = 8.0) -> str | None:
         "give just the number. For a riddle, give just the word or phrase.\n\n"
         f"Post text:\n{text}"
     )
-    try:
-        resp = httpx.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": api_key,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            },
-            json={
-                "model": "claude-haiku-4-5-20251001",
-                "max_tokens": 50,
-                "messages": [{"role": "user", "content": prompt}],
-            },
-            timeout=timeout,
-        )
-        resp.raise_for_status()
-        body = resp.json()
-        for block in body.get("content", []):
-            if block.get("type") == "text":
-                return block["text"].strip().strip('"').strip("'")
-    except Exception:
-        log.exception("LLM fallback failed")
-    return None
+    out = _call_claude(prompt, max_tokens=50)
+    if not out:
+        return None
+    return out.strip().strip('"').strip("'")
+
+
+def is_actionable_by_bot(text: str, intended_comment: str) -> tuple[bool, str]:
+    """LLM safety gate. Returns (safe, reason).
+
+    Asks Claude whether posting `intended_comment` is the ONLY action needed
+    to fairly enter the giveaway described in `text`. Blocks posts that
+    require off-bot actions: inviting/tagging users, following, reposting,
+    creating a new post, clicking external links, etc.
+
+    Fail-open: missing API key, network error, or an unrecognized response
+    all return (True, ...) so the bot keeps shooting when the LLM isn't
+    available. Only an explicit BLOCK from the LLM returns False.
+    """
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        return True, "no API key set; rules check disabled"
+
+    prompt = (
+        "You are reviewing a watch-giveaway social media post to decide if a "
+        "comment-bot can fairly enter. The bot can ONLY post a single comment "
+        "containing exactly the text shown below — it cannot follow accounts, "
+        "tag or invite friends, send DMs, create new posts, click external "
+        "links, like/react, or take any other action.\n\n"
+        f'Post text:\n"""\n{text}\n"""\n\n'
+        f'The bot will post exactly this comment: "{intended_comment}"\n\n'
+        "Does entering this giveaway require ANYTHING BEYOND posting that "
+        "single comment ON THIS POST? Common disqualifying requirements:\n"
+        "- Tagging or inviting other users\n"
+        "- Following an account\n"
+        "- Reposting, sharing, or re-uploading content\n"
+        "- Creating a new TOP-LEVEL post (not a comment). Phrasing like "
+        '"post on the app", "make a post", "create a post", "post about X" '
+        "means a brand-new post, not a reply/comment. BLOCK these.\n"
+        "- Visiting an external link\n"
+        "- Liking or reacting to the post\n"
+        "- DMing the poster (before winning)\n"
+        "- Multi-step actions across multiple posts\n\n"
+        'Post-win costs like "just pay shipping" or "DM me to arrange '
+        'pickup after you win" are OK and do NOT disqualify entry.\n\n'
+        "Reply with one word on the first line: SAFE or BLOCK\n"
+        "Then on a new line, a brief reason (under 20 words)."
+    )
+    out = _call_claude(prompt, max_tokens=80)
+    if not out:
+        return True, "LLM unavailable; proceeding"
+    lines = [ln.strip() for ln in out.splitlines() if ln.strip()]
+    verdict = lines[0].upper() if lines else ""
+    reason = " ".join(lines[1:]).strip() or "no reason given"
+    if verdict.startswith("BLOCK"):
+        return False, reason
+    if verdict.startswith("SAFE"):
+        return True, reason
+    return True, f"unrecognized verdict {verdict!r}; proceeding"
+
+
+# Quick prefilter: only call the LLM giveaway detector on posts that even
+# mention giveaway-shaped words. Skips obvious non-giveaways (opinions,
+# photos of someone's watch, tattoo posts) to save API calls.
+_GIVEAWAY_HINT = re.compile(
+    r"\b(comment|win|first|free|giveaway|drop|merch|hat|shirt|tee|"
+    r"sticker|sweat|hoodie|prize|wants?|solve|yours|claim|"
+    r"gets?\s+(?:this|it|a|an|one))\b",
+    re.IGNORECASE,
+)
+
+
+def find_general_giveaway_comment(text: str) -> tuple[str | None, str]:
+    """LLM-based broad giveaway detector. Catches merch drops, top-N comments,
+    and any new mechanic the local matcher doesn't recognize.
+
+    Returns (comment, status):
+      - ("me",       "yes")  → it's a giveaway; this is the comment to post
+      - (None,       "no")   → LLM definitively says it's not a giveaway
+      - (None, "error")      → LLM unavailable (no key, network, rate limit)
+
+    Caller should persist "no" results in state to avoid re-checking the
+    same post every tick; "error" results should be retried later.
+    """
+    if not text:
+        return None, "no"
+    if not _GIVEAWAY_HINT.search(text):
+        # No giveaway-shaped vocabulary at all — don't bother the LLM.
+        return None, "no"
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        return None, "error"
+
+    prompt = (
+        "You are watching the WatchLink (watchlink.co) account, run by Daniel "
+        "Cheek. He posts a mix of: watch giveaways (sometimes free with "
+        "shipping, sometimes 'first to comment X'), merch giveaways (hats, "
+        "t-shirts, stickers — often 'first N comments get one'), math puzzles, "
+        "and regular content (sales, opinions, jokes, hype).\n\n"
+        "Decide if THIS specific post is an ACTIVE giveaway where the entry "
+        "method is to post a single comment.\n\n"
+        f'Post text:\n"""\n{text}\n"""\n\n'
+        "Reply with exactly ONE line, in one of these two forms:\n"
+        "  NO\n"
+        "  YES <comment_text>\n\n"
+        "The <comment_text> must be:\n"
+        "- A single short string (≤ 25 characters), no quotes around it.\n"
+        "- For 'first N comments' or open-ended invites, use: me\n"
+        "- For math problems or riddles, the numeric or single-word answer.\n"
+        "- For 'first to comment X gets it', use X.\n\n"
+        "Treat these as NO:\n"
+        "- Priced sales (the item costs money beyond shipping)\n"
+        "- Announcements of FUTURE giveaways ('coming next month')\n"
+        "- Opinions, jokes, hype posts, tattoo pics, just-arrived-in-the-mail posts\n"
+        "- Posts about giveaways that have already concluded\n"
+        '- Giveaways that require creating a new TOP-LEVEL post ("post on the '
+        'app today", "make a post about X"). The bot can only comment.\n'
+        "- Giveaways that require following, tagging, DMing, or external clicks."
+    )
+    out = _call_claude(prompt, max_tokens=40)
+    if out is None:
+        return None, "error"
+    line = out.split("\n", 1)[0].strip()
+    upper = line.upper()
+    if upper.startswith("NO"):
+        return None, "no"
+    if upper.startswith("YES"):
+        comment = line[3:].lstrip(":").strip().strip('"').strip("'")
+        if 1 <= len(comment) <= 25:
+            return comment, "yes"
+    # Couldn't parse — treat as transient error so we retry later.
+    return None, "error"
 
 
 def solve_giveaway(text: str) -> str | None:

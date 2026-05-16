@@ -35,7 +35,7 @@ from matcher import (
     find_giveaway_word,
     is_free_giveaway_post,
 )
-from solver import solve_giveaway
+from solver import find_general_giveaway_comment, is_actionable_by_bot, solve_giveaway
 
 BASE = Path(__file__).resolve().parent.parent
 
@@ -89,7 +89,13 @@ def load_dotenv(path: Path = ENV_FILE) -> None:
 
 
 def load_state() -> dict:
-    defaults = {"commented": {}, "matched": {}, "skipped_had_comments": {}}
+    defaults = {
+        "commented": {},
+        "matched": {},
+        "skipped_had_comments": {},
+        "skipped_by_rules": {},
+        "llm_no_giveaway": {},
+    }
     if STATE_FILE.exists():
         loaded = json.loads(STATE_FILE.read_text())
         for k, v in defaults.items():
@@ -153,6 +159,13 @@ def _consider_post(client: WatchlinkClient, post: dict, source: str,
     # avoids matcher work + log noise on every cycle.
     if post_id in state.get("skipped_had_comments", {}):
         return
+    # Already-blocked by the LLM rules check. Don't burn API calls re-asking.
+    if post_id in state.get("skipped_by_rules", {}):
+        return
+    # LLM has already decided this isn't a giveaway. Skip without calling
+    # the LLM again. Remove from seen.json to re-evaluate.
+    if post_id in state.get("llm_no_giveaway", {}):
+        return
 
     text = extract_text(post)
     word = find_giveaway_word(text) if text else None
@@ -179,6 +192,24 @@ def _consider_post(client: WatchlinkClient, post: dict, source: str,
     if not word and is_daniel and is_free_giveaway_post(post, text):
         word = DEFAULT_FREE_DEAL_WORD
         log.info(f"FREE-DEAL post={post_id} (Daniel, $0 listing) → defaulting to {word!r}")
+
+    # Catch-all LLM tier: covers merch drops ("First 3 comments get a WL hat"),
+    # novel mechanics, and anything the local matcher doesn't recognize.
+    # Only runs on Daniel posts, only when nothing else matched, and only if
+    # the post has at least one giveaway-shaped word (cheap regex prefilter).
+    # Negative LLM results are persisted to llm_no_giveaway to avoid retrying.
+    if not word and is_daniel and text:
+        comment, status = find_general_giveaway_comment(text)
+        if status == "yes" and comment:
+            word = comment
+            log.info(f"LLM-GIVEAWAY post={post_id} → {word!r}")
+        elif status == "no":
+            state["llm_no_giveaway"][post_id] = {
+                "source": source,
+                "ts": time.time(),
+                "preview": (text or "")[:140],
+            }
+            save_state(state)
 
     # DEBUG-level diagnostic: one line per unmatched Daniel post so we can
     # reconstruct what each drop looked like at scan time. Off by default.
@@ -234,6 +265,23 @@ def _consider_post(client: WatchlinkClient, post: dict, source: str,
         "ts": time.time(),
     }
     save_state(state)
+
+    # LLM rules check. Catches off-bot requirements (invite friends, follow,
+    # repost, etc.) that the local matcher can't reason about. Fail-open if
+    # no API key or the call errors out. Adds ~0.5–2s but only on a match,
+    # not per scan tick.
+    safe, reason = is_actionable_by_bot(text, word)
+    if not safe:
+        state["skipped_by_rules"][post_id] = {
+            "word": word,
+            "reason": reason,
+            "source": source,
+            "ts": time.time(),
+        }
+        save_state(state)
+        log.info(f"RULES-BLOCK post={post_id} word={word!r} — {reason}")
+        return
+    log.info(f"RULES-OK post={post_id} — {reason}")
 
     if not armed:
         log.info(f"DRY-RUN: would comment {word!r} on post {post_id}")
@@ -351,9 +399,11 @@ def run_loop(armed: bool, interval: int) -> None:
             log.exception("initial auth crashed")
             return
 
+        rules_on = bool(os.environ.get("ANTHROPIC_API_KEY"))
         log.info(
             f"loop armed={armed} interval={interval}s "
-            f"filter={_FILTER_KEYWORDS or 'off'}"
+            f"filter={_FILTER_KEYWORDS or 'off'} "
+            f"rules-check={'on' if rules_on else 'off'}"
         )
         while True:
             tick_start = time.time()
