@@ -236,76 +236,88 @@ def is_actionable_by_bot(text: str, intended_comment: str) -> tuple[bool, str]:
     return True, f"unrecognized verdict {verdict!r}; proceeding"
 
 
-# Quick prefilter: only call the LLM giveaway detector on posts that even
-# mention giveaway-shaped words. Skips obvious non-giveaways (opinions,
-# photos of someone's watch, tattoo posts) to save API calls.
-_GIVEAWAY_HINT = re.compile(
-    r"\b(comment|win|first|free|giveaway|drop|merch|hat|shirt|tee|"
-    r"sticker|sweat|hoodie|prize|wants?|solve|yours|claim|"
-    r"gets?\s+(?:this|it|a|an|one))\b",
-    re.IGNORECASE,
-)
+def classify_giveaway(text: str) -> tuple[str | None, str, str]:
+    """LLM-driven primary classifier for Daniel's posts.
 
+    Decides three things in a single Claude call:
+      1. Is this an active giveaway entered by posting a single comment?
+      2. What KIND of prize: watch / merch / other
+      3. What should the bot comment?
 
-def find_general_giveaway_comment(text: str) -> tuple[str | None, str]:
-    """LLM-based broad giveaway detector. Catches merch drops, top-N comments,
-    and any new mechanic the local matcher doesn't recognize.
-
-    Returns (comment, status):
-      - ("me",       "yes")  → it's a giveaway; this is the comment to post
-      - (None,       "no")   → LLM definitively says it's not a giveaway
-      - (None, "error")      → LLM unavailable (no key, network, rate limit)
+    Returns (comment, kind, status):
+      - status="yes"   → (comment, kind, "yes")   ; kind ∈ {watch, merch, other}
+      - status="no"    → (None,    "unknown", "no")
+      - status="error" → (None,    "unknown", "error")  ; no key, network, rate-limit, unparseable
 
     Caller should persist "no" results in state to avoid re-checking the
-    same post every tick; "error" results should be retried later.
+    same post every tick; "error" results are retried on the next scan.
+
+    `kind` is the watchlist filter's hook: callers should apply the
+    `--filter` keywords only when kind == "watch" (or "unknown", as a
+    safe fallback when the LLM was unavailable).
     """
     if not text:
-        return None, "no"
-    if not _GIVEAWAY_HINT.search(text):
-        # No giveaway-shaped vocabulary at all — don't bother the LLM.
-        return None, "no"
+        return None, "unknown", "no"
     if not os.environ.get("ANTHROPIC_API_KEY"):
-        return None, "error"
+        return None, "unknown", "error"
 
     prompt = (
-        "You are watching the WatchLink (watchlink.co) account, run by Daniel "
+        "You are watching the WatchLink (watchlink.co) account run by Daniel "
         "Cheek. He posts a mix of: watch giveaways (sometimes free with "
-        "shipping, sometimes 'first to comment X'), merch giveaways (hats, "
-        "t-shirts, stickers — often 'first N comments get one'), math puzzles, "
-        "and regular content (sales, opinions, jokes, hype).\n\n"
+        "shipping, sometimes 'first to comment X'), WatchLink-branded merch "
+        "giveaways (hats, t-shirts, stickers, hoodies, mugs), math puzzles, "
+        "and regular content (priced sales, opinions, jokes, hype, photos).\n\n"
         "Decide if THIS specific post is an ACTIVE giveaway where the entry "
         "method is to post a single comment.\n\n"
         f'Post text:\n"""\n{text}\n"""\n\n'
         "Reply with exactly ONE line, in one of these two forms:\n"
         "  NO\n"
-        "  YES <comment_text>\n\n"
-        "The <comment_text> must be:\n"
-        "- A single short string (≤ 25 characters), no quotes around it.\n"
-        "- For 'first N comments' or open-ended invites, use: me\n"
-        "- For math problems or riddles, the numeric or single-word answer.\n"
-        "- For 'first to comment X gets it', use X.\n\n"
+        "  YES <kind> <comment>\n\n"
+        "Where <kind> is exactly one of:\n"
+        "  watch — Daniel is giving away a wristwatch (any brand)\n"
+        "  merch — Daniel is giving away WatchLink-branded gear (hat, "
+        "t-shirt, hoodie, sticker, mug, tote, etc.)\n"
+        "  other — any other prize (cash, gift card, mystery, non-watch "
+        "items that aren't WL merch)\n\n"
+        "And <comment> is the single short text the bot should post "
+        "(≤ 25 characters, no surrounding quotes):\n"
+        "- For 'first to comment X gets it' → X\n"
+        "- For math problems / riddles → the answer\n"
+        "- For 'first N comments win' or open-ended invites → me\n\n"
+        "Examples:\n"
+        "  NO\n"
+        "  YES watch sold\n"
+        "  YES watch 58\n"
+        "  YES watch mine\n"
+        "  YES merch me\n"
+        "  YES merch tee\n\n"
         "Treat these as NO:\n"
-        "- Priced sales (the item costs money beyond shipping)\n"
+        "- Priced sales (item costs money beyond shipping)\n"
         "- Announcements of FUTURE giveaways ('coming next month')\n"
-        "- Opinions, jokes, hype posts, tattoo pics, just-arrived-in-the-mail posts\n"
+        "- Opinions, jokes, hype, tattoo pics, just-arrived-in-the-mail posts\n"
         "- Posts about giveaways that have already concluded\n"
-        '- Giveaways that require creating a new TOP-LEVEL post ("post on the '
-        'app today", "make a post about X"). The bot can only comment.\n'
-        "- Giveaways that require following, tagging, DMing, or external clicks."
+        '- Giveaways requiring a NEW TOP-LEVEL post ("post on the app '
+        'today", "make a post about X") — the bot can only comment\n'
+        "- Giveaways requiring follows, tags, DMs, reposts, or external clicks"
     )
     out = _call_claude(prompt, max_tokens=40)
     if out is None:
-        return None, "error"
+        return None, "unknown", "error"
     line = out.split("\n", 1)[0].strip()
     upper = line.upper()
     if upper.startswith("NO"):
-        return None, "no"
+        return None, "unknown", "no"
     if upper.startswith("YES"):
-        comment = line[3:].lstrip(":").strip().strip('"').strip("'")
-        if 1 <= len(comment) <= 25:
-            return comment, "yes"
-    # Couldn't parse — treat as transient error so we retry later.
-    return None, "error"
+        parts = line.split(maxsplit=2)
+        if len(parts) >= 3:
+            kind = parts[1].lower()
+            if kind not in ("watch", "merch", "other"):
+                kind = "other"
+            comment = parts[2].strip().strip('"').strip("'")
+            if 1 <= len(comment) <= 25:
+                return comment, kind, "yes"
+    # Couldn't parse — treat as transient so we retry later.
+    return None, "unknown", "error"
 
 
 def solve_giveaway(text: str) -> str | None:

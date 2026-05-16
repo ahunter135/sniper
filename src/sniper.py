@@ -35,7 +35,7 @@ from matcher import (
     find_giveaway_word,
     is_free_giveaway_post,
 )
-from solver import find_general_giveaway_comment, is_actionable_by_bot, solve_giveaway
+from solver import classify_giveaway, is_actionable_by_bot, solve_giveaway
 
 BASE = Path(__file__).resolve().parent.parent
 
@@ -168,79 +168,77 @@ def _consider_post(client: WatchlinkClient, post: dict, source: str,
         return
 
     text = extract_text(post)
-    word = find_giveaway_word(text) if text else None
-
     is_daniel = _is_daniel_post(post, source)
-    has_daily_deal_header = bool(text) and bool(DAILY_DEAL_HEADER.search(text))
 
-    # Math-puzzle tier: Daniel's 5/14/26 deal swapped "first to comment X" for
-    # "first to solve this math problem." Tries safe local arithmetic first,
-    # then an Anthropic Haiku call if ANTHROPIC_API_KEY is set in .env. Runs
-    # BEFORE the free-deal tier because math posts often contain the word
-    # "free" (e.g. "...gets this Seiko for free") which would otherwise
-    # mis-fire as a "sold" comment.
-    if not word and is_daniel and has_daily_deal_header:
-        answer = solve_giveaway(text)
-        if answer:
-            word = answer
-            log.info(f"MATH-PUZZLE post={post_id} → {word!r}")
+    # Local fast-path matchers (sub-ms each). The LLM is the primary
+    # decision-maker, but these run first as a backup so the bot still
+    # functions if the LLM is unavailable (no API key, rate-limited, etc.)
+    # and as a high-precision fallback for the quoted-word case.
+    local_word: str | None = None
+    if text:
+        local_word = find_giveaway_word(text)
+        has_daily_deal_header = bool(DAILY_DEAL_HEADER.search(text))
+        if not local_word and is_daniel and has_daily_deal_header:
+            answer = solve_giveaway(text)
+            if answer:
+                local_word = answer
+        if not local_word and is_daniel and is_free_giveaway_post(post, text):
+            local_word = DEFAULT_FREE_DEAL_WORD
 
-    # Fallback: Daniel's "Free Seiko Daily Deal" series (SSK033 GMT, etc.)
-    # is listed at $0 without an explicit "first to comment X" phrase. When
-    # we see Daniel post a $0 listing, default to commenting "sold" — the
-    # community convention for his daily deals.
-    if not word and is_daniel and is_free_giveaway_post(post, text):
-        word = DEFAULT_FREE_DEAL_WORD
-        log.info(f"FREE-DEAL post={post_id} (Daniel, $0 listing) → defaulting to {word!r}")
-
-    # Catch-all LLM tier: covers merch drops ("First 3 comments get a WL hat"),
-    # novel mechanics, and anything the local matcher doesn't recognize.
-    # Only runs on Daniel posts, only when nothing else matched, and only if
-    # the post has at least one giveaway-shaped word (cheap regex prefilter).
-    # Negative LLM results are persisted to llm_no_giveaway to avoid retrying.
-    if not word and is_daniel and text:
-        comment, status = find_general_giveaway_comment(text)
-        if status == "yes" and comment:
-            word = comment
-            log.info(f"LLM-GIVEAWAY post={post_id} → {word!r}")
-        elif status == "no":
+    # Primary classifier: one Claude call per uncached Daniel post that
+    # decides (a) is this a giveaway, (b) watch / merch / other, (c) what
+    # comment to post. Persisted skips (commented/llm_no_giveaway/etc.) at
+    # the top of this function mean each post pays the LLM cost at most once.
+    word: str | None = None
+    kind = "unknown"
+    if is_daniel and text:
+        llm_comment, llm_kind, status = classify_giveaway(text)
+        if status == "no":
             state["llm_no_giveaway"][post_id] = {
                 "source": source,
                 "ts": time.time(),
-                "preview": (text or "")[:140],
+                "preview": text[:140],
             }
             save_state(state)
-
-    # DEBUG-level diagnostic: one line per unmatched Daniel post so we can
-    # reconstruct what each drop looked like at scan time. Off by default.
-    if is_daniel and not word and log.isEnabledFor(logging.DEBUG):
-        brand = post.get("brand")
-        brand_name = brand.get("name") if isinstance(brand, dict) else brand
-        log.debug(
-            f"DANIEL-POST post={post_id} category={post.get('category')!r} "
-            f"brand={brand_name!r} price={post.get('price')!r} "
-            f"formatted_price={post.get('formatted_price')!r} "
-            f"comments={comments_count(post)} "
-            f"has_$0_in_text={'$0' in (text or '')} "
-            f"preview={(text or '')[:120]!r}"
-        )
+            return
+        if status == "yes":
+            kind = llm_kind
+            # Prefer the local matcher's word when it found one — it's
+            # exact-text-match precise. LLM word is the fallback.
+            word = local_word or llm_comment
+            log.info(
+                f"LLM-CLASSIFY post={post_id} kind={kind} "
+                f"comment={(llm_comment or '')!r} local={local_word!r}"
+            )
+        else:  # status == "error"
+            # LLM unavailable. Fall back to local matchers.
+            word = local_word
+            log.info(
+                f"LLM-ERROR post={post_id} — falling back to local "
+                f"word={local_word!r}"
+            )
+    else:
+        word = local_word
 
     if not word:
         return
 
     cached_count = comments_count(post)
     log.info(
-        f"MATCH source={source} post={post_id} word={word!r} "
+        f"MATCH source={source} post={post_id} word={word!r} kind={kind} "
         f"cached_comments={cached_count} preview={text[:140]!r}"
     )
 
-    # Watchlist gate: if --filter is set, every keyword must appear in the
-    # post text or brand. Logged but not persisted to state, so changing the
-    # filter at restart re-considers previously-filtered posts.
-    if not _post_matches_filter(post, text):
+    # Watchlist gate: --filter only applies to watch giveaways. Merch and
+    # other kinds are always allowed past the filter (cheap prizes — sniping
+    # everything is the point). "unknown" (LLM was unavailable) is treated
+    # like "watch" for safety so a stale LLM doesn't bypass the user's
+    # watchlist preference.
+    filter_relevant = kind in ("watch", "unknown")
+    if filter_relevant and not _post_matches_filter(post, text):
         log.info(
-            f"FILTERED post={post_id}: keywords {_FILTER_KEYWORDS!r} "
-            f"not all present in text/brand — skip"
+            f"FILTERED post={post_id}: kind={kind} keywords "
+            f"{_FILTER_KEYWORDS!r} not all present — skip"
         )
         return
 

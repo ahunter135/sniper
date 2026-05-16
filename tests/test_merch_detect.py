@@ -1,8 +1,12 @@
-"""Battery test for the LLM general-giveaway detector.
+"""Battery test for the LLM primary classifier.
 
-Covers merch giveaways (hats, t-shirts, stickers) and other novel mechanics
-the local matcher doesn't recognize. Also confirms the detector says NO to
-non-giveaways (sales, opinions, jokes, photos).
+`classify_giveaway` returns (comment, kind, status). This battery covers:
+  - YES + watch (free Seiko deals, math problems, quoted-word watch giveaways)
+  - YES + merch (hats, t-shirts, stickers, hoodies)
+  - NO (sales, opinions, future announcements, concluded giveaways)
+
+The `kind` field gates whether `--filter` keywords apply: only `watch`
+giveaways get filtered by the user's watchlist; merch passes through.
 
 Run:
     source .venv/bin/activate
@@ -17,79 +21,92 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 
-from solver import find_general_giveaway_comment
+from solver import classify_giveaway
 from sniper import load_dotenv
 
 
-CASES: list[tuple[str, str, str | None]] = [
-    # (label, post_text, expected_comment_or_None)
-    # None means: expected status "no" (not a giveaway)
-    # A string means: expected status "yes" and that's the expected comment
-
-    # --- Merch giveaways (should detect)
+# Each case: (label, post_text, expected_comment_or_None, expected_kind_or_None)
+# expected_comment=None means we expect status="no"; expected_kind is the
+# expected kind on a "yes" verdict (ignored on "no").
+CASES: list[tuple[str, str, str | None, str | None]] = [
+    # --- WATCH giveaways (filter SHOULD apply here)
     (
-        "first 3 get a WL hat",
-        "First 3 comments get a WL hat",
-        "me",
-    ),
-    (
-        "first to comment tee gets a tshirt",
-        'First to comment "tee" gets a WatchLink t-shirt',
-        "tee",
-    ),
-    (
-        "sticker drop",
-        "I have 5 WL stickers to give out. First 5 people to drop a 🐢 win one!",
-        "🐢",
-    ),
-    (
-        "hoodie giveaway",
-        "Free WatchLink hoodie for the first commenter. Just say me below.",
-        "me",
-    ),
-
-    # --- Watch giveaways (should detect; existing matchers also cover these)
-    (
-        "quoted-word watch giveaway",
+        "watch: quoted-word",
         'First person to comment "mine" gets this Tudor BB58. $0 + shipping.',
-        "mine",
+        "mine", "watch",
     ),
     (
-        "math problem (no header)",
-        "Solve this and the watch is yours: 9 x 8 - 12",
-        "60",
+        "watch: Free99 daily deal",
+        "WatchLink Daily Deal 5/13/26. Look at this beauty. Free99 + shipping "
+        "Who's snaggin'? Seiko SSK033.",
+        "sold", "watch",
+    ),
+    (
+        "watch: math problem",
+        "WatchLink Daily Deal. First person to solve gets this Seiko for "
+        "free (just pay shipping): (18/3) x (7+5) - 14",
+        "58", "watch",
+    ),
+    (
+        "watch: $0 panda",
+        "WatchLink Daily Deal. Take this Seiko Panda for $0 + shipping. "
+        "First to comment 'sold' wins.",
+        "sold", "watch",
     ),
 
-    # --- NOT giveaways (should say NO)
+    # --- MERCH giveaways (filter should NOT apply)
     (
-        "got a hat in the mail",
+        "merch: WL hat top-N",
+        "First 3 comments get a WL hat",
+        "me", "merch",
+    ),
+    (
+        "merch: tshirt quoted-word",
+        'First to comment "tee" gets a WatchLink t-shirt',
+        "tee", "merch",
+    ),
+    (
+        "merch: hoodie",
+        "Free WatchLink hoodie for the first commenter. Just say me below.",
+        "me", "merch",
+    ),
+    (
+        "merch: sticker drop",
+        "I have 5 WL stickers to give out. First 5 to drop a 🐢 win one!",
+        "🐢", "merch",
+    ),
+
+    # --- NOT giveaways
+    (
+        "no: just arrived",
         "Just received my WatchLink hat in the mail today. Love it.",
-        None,
+        None, None,
     ),
     (
-        "future merch announcement",
+        "no: future announce",
         "Working on some new merch designs. Hats and tees coming next month!",
-        None,
+        None, None,
     ),
     (
-        "regular sale",
+        "no: priced sale",
         "Selling my Seiko SKX007 for $450 + shipping. DM if interested.",
-        None,
+        None, None,
     ),
     (
-        "tattoo hype",
+        "no: tattoo hype",
         "Antonio Guerrera is a wild man for getting a WatchLink tattoo 😭",
-        None,
+        None, None,
     ),
     (
-        "concluded giveaway",
+        "no: concluded",
         "Congrats to @brian for winning yesterday's hat giveaway!",
-        None,
+        None, None,
     ),
     (
-        "regular content",
-        "Haters are saying this is AI generated. It's not.",
-        None,
+        "no: top-level post required",
+        "We're dropping this Seiko Panda for free. To get it, just post on "
+        "the app today.",
+        None, None,
     ),
 ]
 
@@ -97,25 +114,28 @@ CASES: list[tuple[str, str, str | None]] = [
 def main() -> None:
     load_dotenv()
     rows: list[dict] = []
-    for i, (label, text, expected) in enumerate(CASES):
+    for i, (label, text, exp_comment, exp_kind) in enumerate(CASES):
         if i > 0:
             time.sleep(1.5)
         t0 = time.perf_counter()
-        comment, status = find_general_giveaway_comment(text)
+        comment, kind, status = classify_giveaway(text)
         elapsed = time.perf_counter() - t0
-        if expected is None:
+
+        if exp_comment is None:
             ok = status == "no"
             exp_str = "NO"
-            got_str = "NO" if status == "no" else (
-                f"YES {comment!r}" if status == "yes" else "ERROR"
+            got_str = (
+                "NO" if status == "no" else
+                (f"YES {kind} {comment!r}" if status == "yes" else "ERROR")
             )
         else:
-            ok = status == "yes" and comment == expected
-            exp_str = f"YES {expected!r}"
+            ok = (status == "yes" and comment == exp_comment and kind == exp_kind)
+            exp_str = f"YES {exp_kind} {exp_comment!r}"
             got_str = (
-                f"YES {comment!r}" if status == "yes" else
+                f"YES {kind} {comment!r}" if status == "yes" else
                 ("NO" if status == "no" else "ERROR")
             )
+
         rows.append({
             "label": label,
             "expected": exp_str,
@@ -131,7 +151,8 @@ def main() -> None:
         ok = "✓" if r["ok"] else "✗"
         lat = f"{r['latency_s']:.2f} s"
         print(
-            f"| {i} | {r['label']} | {r['expected']} | {r['got']} | {ok} | {lat} |"
+            f"| {i} | {r['label']} | {r['expected']} | {r['got']} | "
+            f"{ok} | {lat} |"
         )
 
     passed = sum(1 for r in rows if r["ok"])
