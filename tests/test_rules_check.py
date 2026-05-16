@@ -9,12 +9,16 @@ Run:
 """
 from __future__ import annotations
 
+import os
 import sys
 import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
+
+os.environ.setdefault("SNIPER_LOG_FILE", "/tmp/watchlink_bench.log")
+os.environ.setdefault("SNIPER_LLM_MIN_INTERVAL", "0")
 
 from solver import is_actionable_by_bot
 from sniper import load_dotenv

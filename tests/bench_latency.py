@@ -14,6 +14,7 @@ Run:
 """
 from __future__ import annotations
 
+import os
 import sys
 import time
 from pathlib import Path
@@ -21,6 +22,14 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
+
+# Redirect the sniper file-handler to /tmp BEFORE importing sniper, so the
+# bench's POSTED-on-stub entries don't pollute the live bot's log file.
+os.environ.setdefault("SNIPER_LOG_FILE", "/tmp/watchlink_bench.log")
+# Disable the production rate-limit throttle so back-to-back test calls run.
+# The Anthropic per-minute cap will still apply server-side; the retry helper
+# handles it.
+os.environ.setdefault("SNIPER_LLM_MIN_INTERVAL", "0")
 
 from api import WatchlinkClient, extract_text
 from sniper import _consider_post, _creds, COOKIES_FILE, DANIEL_USER_ID, load_dotenv

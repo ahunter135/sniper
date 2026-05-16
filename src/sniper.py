@@ -48,7 +48,9 @@ FEED_CATEGORIES: list[str] = []
 ENV_FILE = BASE / ".env"
 COOKIES_FILE = BASE / "state" / "cookies.json"
 STATE_FILE = BASE / "state" / "seen.json"
-LOG_FILE = BASE / "logs" / "sniper.log"
+# Log file location. Honored env override lets tests (tests/bench_latency.py)
+# redirect to /tmp so test runs don't pollute the live bot's log.
+LOG_FILE = Path(os.environ.get("SNIPER_LOG_FILE") or (BASE / "logs" / "sniper.log"))
 
 MAX_POSTS_PER_SCAN = 20
 
@@ -57,6 +59,15 @@ MAX_POSTS_PER_SCAN = 20
 # the post text or brand metadata. Empty list = no filter (current behavior).
 # Set at startup from --filter.
 _FILTER_KEYWORDS: list[str] = []
+
+# Cap on classify_giveaway() calls per scan tick. The first scan after startup
+# wants to LLM-classify every historical Daniel post (~20 of them) — without a
+# cap that's an instant 429 cascade that stalls the bot for minutes. With this
+# cap the bot amortizes catch-up over multiple ticks: at 5s interval and 1
+# call/tick that's 12 classifications/min, well under Anthropic's free-tier
+# limit. New posts at the top of the feed get classified first.
+_LLM_CALLS_PER_TICK = 1
+_llm_calls_this_tick = 0
 
 _console = logging.StreamHandler(sys.stdout)
 _console.setFormatter(logging.Formatter("%(asctime)s %(message)s", datefmt="%H:%M:%S"))
@@ -95,6 +106,7 @@ def load_state() -> dict:
         "skipped_had_comments": {},
         "skipped_by_rules": {},
         "llm_no_giveaway": {},
+        "skipped_by_filter": {},
     }
     if STATE_FILE.exists():
         loaded = json.loads(STATE_FILE.read_text())
@@ -166,6 +178,14 @@ def _consider_post(client: WatchlinkClient, post: dict, source: str,
     # the LLM again. Remove from seen.json to re-evaluate.
     if post_id in state.get("llm_no_giveaway", {}):
         return
+    # Previously rejected by the --filter gate. We only short-circuit if the
+    # filter keywords haven't changed since the rejection was persisted; a new
+    # filter means the post deserves re-evaluation.
+    prior_filter = state.get("skipped_by_filter", {}).get(post_id)
+    if prior_filter is not None:
+        prior_keywords = sorted(prior_filter.get("filter_at_time") or [])
+        if prior_keywords == sorted(_FILTER_KEYWORDS):
+            return
 
     text = extract_text(post)
     is_daniel = _is_daniel_post(post, source)
@@ -189,34 +209,45 @@ def _consider_post(client: WatchlinkClient, post: dict, source: str,
     # decides (a) is this a giveaway, (b) watch / merch / other, (c) what
     # comment to post. Persisted skips (commented/llm_no_giveaway/etc.) at
     # the top of this function mean each post pays the LLM cost at most once.
+    # Per-tick budget prevents the startup catch-up from triggering a 429
+    # cascade — when exhausted, posts fall through to local-only and get a
+    # proper LLM verdict on a later tick.
+    global _llm_calls_this_tick
     word: str | None = None
     kind = "unknown"
     if is_daniel and text:
-        llm_comment, llm_kind, status = classify_giveaway(text)
-        if status == "no":
-            state["llm_no_giveaway"][post_id] = {
-                "source": source,
-                "ts": time.time(),
-                "preview": text[:140],
-            }
-            save_state(state)
-            return
-        if status == "yes":
-            kind = llm_kind
-            # Prefer the local matcher's word when it found one — it's
-            # exact-text-match precise. LLM word is the fallback.
-            word = local_word or llm_comment
-            log.info(
-                f"LLM-CLASSIFY post={post_id} kind={kind} "
-                f"comment={(llm_comment or '')!r} local={local_word!r}"
-            )
-        else:  # status == "error"
-            # LLM unavailable. Fall back to local matchers.
+        if _llm_calls_this_tick >= _LLM_CALLS_PER_TICK:
+            # Defer LLM classification to a future tick. Don't persist —
+            # this post will come back through the pipeline next scan.
             word = local_word
-            log.info(
-                f"LLM-ERROR post={post_id} — falling back to local "
-                f"word={local_word!r}"
-            )
+            kind = "unknown"
+        else:
+            _llm_calls_this_tick += 1
+            llm_comment, llm_kind, status = classify_giveaway(text)
+            if status == "no":
+                state["llm_no_giveaway"][post_id] = {
+                    "source": source,
+                    "ts": time.time(),
+                    "preview": text[:140],
+                }
+                save_state(state)
+                return
+            if status == "yes":
+                kind = llm_kind
+                # Prefer the local matcher's word when it found one — it's
+                # exact-text-match precise. LLM word is the fallback.
+                word = local_word or llm_comment
+                log.info(
+                    f"LLM-CLASSIFY post={post_id} kind={kind} "
+                    f"comment={(llm_comment or '')!r} local={local_word!r}"
+                )
+            else:  # status == "error"
+                # LLM unavailable. Fall back to local matchers.
+                word = local_word
+                log.info(
+                    f"LLM-ERROR post={post_id} — falling back to local "
+                    f"word={local_word!r}"
+                )
     else:
         word = local_word
 
@@ -231,13 +262,24 @@ def _consider_post(client: WatchlinkClient, post: dict, source: str,
 
     # Watchlist gate: --filter only applies to watch giveaways. Merch and
     # other kinds are always allowed past the filter (cheap prizes — sniping
-    # everything is the point). "unknown" (LLM was unavailable) is treated
-    # like "watch" for safety so a stale LLM doesn't bypass the user's
-    # watchlist preference.
+    # everything is the point). "unknown" (LLM was unavailable / deferred)
+    # is treated like "watch" for safety so a stale LLM doesn't bypass the
+    # user's watchlist preference.
     filter_relevant = kind in ("watch", "unknown")
-    if filter_relevant and not _post_matches_filter(post, text):
+    if _FILTER_KEYWORDS and filter_relevant and not _post_matches_filter(post, text):
+        # Only persist when we had a confirmed kind. With kind="unknown"
+        # we'd lock in a stale rejection on a post we never properly
+        # classified — better to retry next tick when budget permits.
+        if kind != "unknown":
+            state["skipped_by_filter"][post_id] = {
+                "filter_at_time": sorted(_FILTER_KEYWORDS),
+                "kind": kind,
+                "word": word,
+                "ts": time.time(),
+            }
+            save_state(state)
         log.info(
-            f"FILTERED post={post_id}: kind={kind} keywords "
+            f"FILTERED post={post_id} kind={kind} keywords "
             f"{_FILTER_KEYWORDS!r} not all present — skip"
         )
         return
@@ -368,6 +410,8 @@ def _scan_all(client: WatchlinkClient, armed: bool, state: dict) -> None:
     match, skip, post, or error happens — at 2s polling, a per-tick "scanned
     N posts" line drowns everything else.
     """
+    global _llm_calls_this_tick
+    _llm_calls_this_tick = 0
     posts = client.user_posts(DANIEL_USER_ID, page=1, per_page=MAX_POSTS_PER_SCAN)
     _scan(client, posts, f"profile:{DANIEL_USER_ID}", armed, state)
 

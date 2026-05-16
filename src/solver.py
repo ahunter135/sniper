@@ -24,18 +24,39 @@ import httpx
 log = logging.getLogger("sniper.solver")
 
 
+# Global minimum interval between Claude calls (any caller — classify_giveaway,
+# is_actionable_by_bot, solve_with_llm). The Anthropic free tier is 5 RPM
+# (1 call / 12s); default 13s gives a small safety margin. Override via env:
+#     SNIPER_LLM_MIN_INTERVAL=2.5   # for build tier (50 RPM)
+# When a call is throttled by this gate, _call_claude returns None
+# immediately — no retry, no wait — so the scan loop stays responsive.
+_LLM_MIN_INTERVAL = float(os.environ.get("SNIPER_LLM_MIN_INTERVAL", "13"))
+_last_claude_call_ts: float = 0.0
+
+
 def _call_claude(prompt: str, *, max_tokens: int = 80,
                  timeout: float = 8.0, max_retries: int = 2) -> str | None:
     """Single Claude call with retry on 429 / 5xx. Returns text or None.
 
     Returns None when:
       - ANTHROPIC_API_KEY is unset
+      - Globally throttled (last call < _LLM_MIN_INTERVAL seconds ago)
       - All retries exhausted on a transient error
       - The response shape is unexpected
     """
+    global _last_claude_call_ts
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
         return None
+    now = time.monotonic()
+    elapsed = now - _last_claude_call_ts
+    if elapsed < _LLM_MIN_INTERVAL:
+        log.info(
+            f"claude throttled ({elapsed:.1f}s since last call, "
+            f"min {_LLM_MIN_INTERVAL}s)"
+        )
+        return None
+    _last_claude_call_ts = now
     for attempt in range(max_retries + 1):
         try:
             resp = httpx.post(
@@ -293,12 +314,19 @@ def classify_giveaway(text: str) -> tuple[str | None, str, str]:
         "  YES merch tee\n\n"
         "Treat these as NO:\n"
         "- Priced sales (item costs money beyond shipping)\n"
-        "- Announcements of FUTURE giveaways ('coming next month')\n"
+        "- Announcements of an UPCOMING giveaway — even later TODAY — that "
+        "isn't live yet. Phrasing like \"going to be today's daily deal\", "
+        '"be ready when it drops", "later today", "coming up", "stay tuned", '
+        '"about to drop" means the giveaway hasn\'t opened yet. Wait for the '
+        "actual drop post.\n"
+        "- Posts hinting at a top-level POST entry mechanic, not a comment. "
+        'Phrasing like "post on the app today", "make a post", "create a '
+        'post", "get in your post first", "post first", "make sure you post" '
+        "all mean entry requires a NEW TOP-LEVEL post.\n"
         "- Opinions, jokes, hype, tattoo pics, just-arrived-in-the-mail posts\n"
         "- Posts about giveaways that have already concluded\n"
-        '- Giveaways requiring a NEW TOP-LEVEL post ("post on the app '
-        'today", "make a post about X") — the bot can only comment\n'
-        "- Giveaways requiring follows, tags, DMs, reposts, or external clicks"
+        "- Giveaways requiring follows, tags, invites, DMs, reposts, or "
+        "external clicks"
     )
     out = _call_claude(prompt, max_tokens=40)
     if out is None:
