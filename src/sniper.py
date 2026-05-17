@@ -145,9 +145,15 @@ def _is_daniel_post(post: dict, source: str) -> bool:
     return _post_author_id(post) == DANIEL_USER_ID
 
 
-def _post_matches_filter(post: dict, text: str | None) -> bool:
+def _post_matches_filter(post: dict, text: str | None,
+                         watch_line: str | None = None) -> bool:
     """True if all _FILTER_KEYWORDS appear (case-insensitive) somewhere in
-    the post text or brand metadata. Always True when the filter is empty."""
+    the post text, brand metadata, OR the LLM-identified watch line.
+
+    `watch_line` lets `--filter presage` match a post whose body only shows
+    a reference number ("SRPJ13") — the LLM augments the haystack with
+    canonical model names from its watch-catalog knowledge.
+    """
     if not _FILTER_KEYWORDS:
         return True
     haystack = (text or "").lower()
@@ -156,6 +162,8 @@ def _post_matches_filter(post: dict, text: str | None) -> bool:
         haystack += " " + str(brand.get("name") or "").lower()
     elif isinstance(brand, str):
         haystack += " " + brand.lower()
+    if watch_line:
+        haystack += " " + watch_line.lower()
     return all(kw.lower() in haystack for kw in _FILTER_KEYWORDS)
 
 
@@ -215,6 +223,7 @@ def _consider_post(client: WatchlinkClient, post: dict, source: str,
     global _llm_calls_this_tick
     word: str | None = None
     kind = "unknown"
+    watch_line: str | None = None
     if is_daniel and text:
         if _llm_calls_this_tick >= _LLM_CALLS_PER_TICK:
             # Defer LLM classification to a future tick. Don't persist —
@@ -223,7 +232,7 @@ def _consider_post(client: WatchlinkClient, post: dict, source: str,
             kind = "unknown"
         else:
             _llm_calls_this_tick += 1
-            llm_comment, llm_kind, status = classify_giveaway(text)
+            llm_comment, llm_kind, status, llm_line = classify_giveaway(text)
             if status == "no":
                 state["llm_no_giveaway"][post_id] = {
                     "source": source,
@@ -234,12 +243,14 @@ def _consider_post(client: WatchlinkClient, post: dict, source: str,
                 return
             if status == "yes":
                 kind = llm_kind
+                watch_line = llm_line if kind == "watch" else None
                 # Prefer the local matcher's word when it found one — it's
                 # exact-text-match precise. LLM word is the fallback.
                 word = local_word or llm_comment
                 log.info(
                     f"LLM-CLASSIFY post={post_id} kind={kind} "
-                    f"comment={(llm_comment or '')!r} local={local_word!r}"
+                    f"comment={(llm_comment or '')!r} local={local_word!r} "
+                    f"line={watch_line!r}"
                 )
             else:  # status == "error"
                 # LLM unavailable. Fall back to local matchers.
@@ -266,7 +277,10 @@ def _consider_post(client: WatchlinkClient, post: dict, source: str,
     # is treated like "watch" for safety so a stale LLM doesn't bypass the
     # user's watchlist preference.
     filter_relevant = kind in ("watch", "unknown")
-    if _FILTER_KEYWORDS and filter_relevant and not _post_matches_filter(post, text):
+    if (
+        _FILTER_KEYWORDS and filter_relevant
+        and not _post_matches_filter(post, text, watch_line=watch_line)
+    ):
         # Only persist when we had a confirmed kind. With kind="unknown"
         # we'd lock in a stale rejection on a post we never properly
         # classified — better to retry next tick when budget permits.
@@ -275,12 +289,13 @@ def _consider_post(client: WatchlinkClient, post: dict, source: str,
                 "filter_at_time": sorted(_FILTER_KEYWORDS),
                 "kind": kind,
                 "word": word,
+                "line": watch_line,
                 "ts": time.time(),
             }
             save_state(state)
         log.info(
-            f"FILTERED post={post_id} kind={kind} keywords "
-            f"{_FILTER_KEYWORDS!r} not all present — skip"
+            f"FILTERED post={post_id} kind={kind} line={watch_line!r} "
+            f"keywords {_FILTER_KEYWORDS!r} not all present — skip"
         )
         return
 

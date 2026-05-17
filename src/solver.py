@@ -257,30 +257,30 @@ def is_actionable_by_bot(text: str, intended_comment: str) -> tuple[bool, str]:
     return True, f"unrecognized verdict {verdict!r}; proceeding"
 
 
-def classify_giveaway(text: str) -> tuple[str | None, str, str]:
+def classify_giveaway(text: str) -> tuple[str | None, str, str, str | None]:
     """LLM-driven primary classifier for Daniel's posts.
 
-    Decides three things in a single Claude call:
+    Decides four things in a single Claude call:
       1. Is this an active giveaway entered by posting a single comment?
       2. What KIND of prize: watch / merch / other
       3. What should the bot comment?
+      4. For watches: what's the line/family/model? (e.g. "Seiko Presage
+         SRPJ13", inferred even when the post only shows a reference number)
 
-    Returns (comment, kind, status):
-      - status="yes"   → (comment, kind, "yes")   ; kind ∈ {watch, merch, other}
-      - status="no"    → (None,    "unknown", "no")
-      - status="error" → (None,    "unknown", "error")  ; no key, network, rate-limit, unparseable
+    Returns (comment, kind, status, line):
+      - status="yes"   → (comment, kind, "yes", line_or_None)
+      - status="no"    → (None,    "unknown", "no",    None)
+      - status="error" → (None,    "unknown", "error", None)
 
-    Caller should persist "no" results in state to avoid re-checking the
-    same post every tick; "error" results are retried on the next scan.
-
-    `kind` is the watchlist filter's hook: callers should apply the
-    `--filter` keywords only when kind == "watch" (or "unknown", as a
-    safe fallback when the LLM was unavailable).
+    `line` is the LLM's best guess at the specific watch family — used by
+    the --filter gate so e.g. `--filter presage` matches "SRPJ13" posts
+    even when the literal word "Presage" never appears in Daniel's text.
+    None for merch/other/unknown.
     """
     if not text:
-        return None, "unknown", "no"
+        return None, "unknown", "no", None
     if not os.environ.get("ANTHROPIC_API_KEY"):
-        return None, "unknown", "error"
+        return None, "unknown", "error", None
 
     prompt = (
         "You are watching the WatchLink (watchlink.co) account run by Daniel "
@@ -291,9 +291,14 @@ def classify_giveaway(text: str) -> tuple[str | None, str, str]:
         "Decide if THIS specific post is an ACTIVE giveaway where the entry "
         "method is to post a single comment.\n\n"
         f'Post text:\n"""\n{text}\n"""\n\n'
-        "Reply with exactly ONE line, in one of these two forms:\n"
-        "  NO\n"
-        "  YES <kind> <comment>\n\n"
+        "Reply with EXACTLY one of these formats. NO extra prose.\n\n"
+        "  Form 1 (not a giveaway):\n"
+        "    NO\n\n"
+        "  Form 2 (giveaway, non-watch):\n"
+        "    YES <kind> <comment>\n\n"
+        "  Form 3 (giveaway, watch — two lines, no blank between):\n"
+        "    YES watch <comment>\n"
+        "    LINE <watch_line>\n\n"
         "Where <kind> is exactly one of:\n"
         "  watch — Daniel is giving away a wristwatch (any brand)\n"
         "  merch — Daniel is giving away WatchLink-branded gear (hat, "
@@ -305,12 +310,23 @@ def classify_giveaway(text: str) -> tuple[str | None, str, str]:
         "- For 'first to comment X gets it' → X\n"
         "- For math problems / riddles → the answer\n"
         "- For 'first N comments win' or open-ended invites → me\n\n"
+        "For watch giveaways ONLY, the second LINE identifies the watch "
+        "family/model using your watch-catalog knowledge. Recognise the "
+        "model even when the post only shows a brand + reference number "
+        "(e.g. 'SRPJ13' → 'Seiko Presage SRPJ13'; 'SARW035' → 'Seiko "
+        "Presage SARW035'; 'BB58' → 'Tudor Black Bay 58'; '126610LN' → "
+        "'Rolex Submariner 126610LN'). When the watch is genuinely "
+        "ambiguous (e.g. just 'Free Seiko' with no model details), "
+        "write: <brand> (line unknown).\n\n"
         "Examples:\n"
-        "  NO\n"
+        "  NO\n\n"
         "  YES watch sold\n"
+        "  LINE Seiko Presage SRPJ13\n\n"
         "  YES watch 58\n"
+        "  LINE Seiko (line unknown)\n\n"
         "  YES watch mine\n"
-        "  YES merch me\n"
+        "  LINE Tudor Black Bay 58\n\n"
+        "  YES merch me\n\n"
         "  YES merch tee\n\n"
         "Treat these as NO:\n"
         "- Priced sales (item costs money beyond shipping)\n"
@@ -328,24 +344,33 @@ def classify_giveaway(text: str) -> tuple[str | None, str, str]:
         "- Giveaways requiring follows, tags, invites, DMs, reposts, or "
         "external clicks"
     )
-    out = _call_claude(prompt, max_tokens=40)
+    out = _call_claude(prompt, max_tokens=80)
     if out is None:
-        return None, "unknown", "error"
-    line = out.split("\n", 1)[0].strip()
-    upper = line.upper()
+        return None, "unknown", "error", None
+    response_lines = [ln.strip() for ln in out.split("\n") if ln.strip()]
+    first = response_lines[0] if response_lines else ""
+    upper = first.upper()
     if upper.startswith("NO"):
-        return None, "unknown", "no"
+        return None, "unknown", "no", None
     if upper.startswith("YES"):
-        parts = line.split(maxsplit=2)
+        parts = first.split(maxsplit=2)
         if len(parts) >= 3:
             kind = parts[1].lower()
             if kind not in ("watch", "merch", "other"):
                 kind = "other"
             comment = parts[2].strip().strip('"').strip("'")
             if 1 <= len(comment) <= 25:
-                return comment, kind, "yes"
+                # Optional LINE on subsequent line — only meaningful for watches.
+                watch_line: str | None = None
+                if kind == "watch":
+                    for subsequent in response_lines[1:]:
+                        if subsequent.upper().startswith("LINE"):
+                            watch_line = subsequent[4:].strip().strip(":").strip()
+                            watch_line = watch_line or None
+                            break
+                return comment, kind, "yes", watch_line
     # Couldn't parse — treat as transient so we retry later.
-    return None, "unknown", "error"
+    return None, "unknown", "error", None
 
 
 def solve_giveaway(text: str) -> str | None:
