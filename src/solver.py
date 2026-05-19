@@ -324,6 +324,8 @@ def classify_giveaway(text: str) -> tuple[str | None, str, str, str | None]:
         "- SARW, SARX, SARY, SARZ → Seiko Presage\n"
         "- SARB → Seiko classic dress / Alpinist (NOT a sport diver)\n"
         "- SRPJ, SRPB, SRPC → Seiko Presage\n"
+        "- SRLP (e.g. SRLP75) → Seiko Presage (limited editions / "
+        "collabs like the Riki Watanabe series)\n"
         "- SSA (e.g. SSA427, SSA395) → Seiko Presage Cocktail Time auto\n"
         "- SPB refs (apply these rules in order; first match wins):\n"
         "    Rule 1 (Prospex, ALWAYS): SPB143, SPB145, SPB147, SPB149, "
