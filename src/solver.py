@@ -33,6 +33,14 @@ log = logging.getLogger("sniper.solver")
 _LLM_MIN_INTERVAL = float(os.environ.get("SNIPER_LLM_MIN_INTERVAL", "13"))
 _last_claude_call_ts: float = 0.0
 
+# Model selection. Default Haiku 4.5 (fast, cheap, mostly accurate). Override
+# via SNIPER_LLM_MODEL for harder questions / trivia accuracy:
+#     SNIPER_LLM_MODEL=claude-sonnet-4-6              # ~2-3× slower, better recall
+#     SNIPER_LLM_MODEL=claude-opus-4-7                # ~5-10× slower, highest accuracy
+# Anthropic's Messages API expects model IDs in canonical form; see
+# https://docs.anthropic.com/en/docs/about-claude/models.
+_LLM_MODEL = os.environ.get("SNIPER_LLM_MODEL", "claude-haiku-4-5-20251001")
+
 
 def _call_claude(prompt: str, *, max_tokens: int = 80,
                  timeout: float = 8.0, max_retries: int = 2) -> str | None:
@@ -67,7 +75,7 @@ def _call_claude(prompt: str, *, max_tokens: int = 80,
                     "content-type": "application/json",
                 },
                 json={
-                    "model": "claude-haiku-4-5-20251001",
+                    "model": _LLM_MODEL,
                     "max_tokens": max_tokens,
                     "messages": [{"role": "user", "content": prompt}],
                 },
