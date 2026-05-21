@@ -212,6 +212,54 @@ def solve_with_llm(text: str) -> str | None:
     return out.strip().strip('"').strip("'")
 
 
+# Deterministic safety net: phrases that almost always mean the post requires
+# off-bot action ("tell somebody about us, then comment 'done' with proof").
+# Run BEFORE the LLM rules check so we still fail-closed when the LLM is
+# rate-limited / offline. Conservative wording — biased toward false-positives
+# (skip a real giveaway) over false-negatives (post on a rule-violating one).
+_OFF_BOT_RED_FLAGS = re.compile(
+    r"\b(?:"
+    # Off-platform sharing / spreading the word about us
+    r"tell\s+(?:somebody|someone|somebodies|anybody|anyone|"
+    r"a\s+friend|your\s+friends?|some\s+friends?|"
+    r"\d+\s+friends?|two\s+friends?|three\s+friends?|"
+    r"people|everyone)"
+    r"|spread\s+the\s+word"
+    # Proof / receipts requirements
+    r"|(?:send|dm|message|provide|show)\s+(?:me|us|daniel|him|the\s+host)?\s*"
+    r"(?:proof|receipts?|screenshots?|evidence)"
+    r"|prove\s+(?:that\s+)?you"
+    # Tag / invite N friends
+    r"|tag\s+(?:\d+|two|three|four|five|some|your|a)\s+(?:friends?|people|users?)"
+    r"|invite\s+(?:\d+|two|three|four|five|some|your|a)\s+(?:friends?|people|users?)"
+    # Pre-comment requirements (any action gated by "before commenting")
+    r"|before\s+(?:you\s+)?comment(?:ing)?"
+    # Follow / repost / external platforms
+    r"|follow\s+(?:us|our|@|me\s+on)"
+    r"|repost\s+(?:our|this|the|to|on|on\s+your)"
+    r"|share\s+(?:this\s+)?(?:to|on)\s+(?:your\s+)?(?:story|feed|page|wall)"
+    # Signup / subscribe / external clicks
+    r"|sign\s+up\s+(?:on|for|at|first)"
+    r"|subscribe\s+to"
+    r"|link\s+in\s+(?:bio|comments?)"
+    # Top-level post mechanic (different from commenting)
+    r"|post\s+on\s+the\s+app"
+    r"|(?:make|create)\s+(?:a|your)\s+(?:own\s+)?post"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def has_off_bot_requirement(text: str) -> tuple[bool, str]:
+    """True if `text` contains a phrase that means entry requires more than a
+    single comment. Returns (matched, matching_phrase). LLM-free, works
+    when rate-limited."""
+    if not text:
+        return False, ""
+    m = _OFF_BOT_RED_FLAGS.search(text)
+    return (True, m.group(0)) if m else (False, "")
+
+
 def is_actionable_by_bot(text: str, intended_comment: str) -> tuple[bool, str]:
     """LLM safety gate. Returns (safe, reason).
 
@@ -224,6 +272,15 @@ def is_actionable_by_bot(text: str, intended_comment: str) -> tuple[bool, str]:
     all return (True, ...) so the bot keeps shooting when the LLM isn't
     available. Only an explicit BLOCK from the LLM returns False.
     """
+    # Deterministic pre-screen — fail-closed on red-flag phrasing even when
+    # the LLM is unavailable. This is what should have caught post 3093
+    # ("tell somebody about WatchLink … message me receipts … before
+    # commenting 'done'") when Haiku was throttled and the LLM rules check
+    # fell back to fail-open.
+    matched, phrase = has_off_bot_requirement(text)
+    if matched:
+        return False, f"off-bot action required (red-flag phrase {phrase!r})"
+
     if not os.environ.get("ANTHROPIC_API_KEY"):
         return True, "no API key set; rules check disabled"
 
@@ -286,6 +343,14 @@ def classify_giveaway(text: str) -> tuple[str | None, str, str, str | None]:
     None for merch/other/unknown.
     """
     if not text:
+        return None, "unknown", "no", None
+    # Hard veto: if the post text contains an off-bot-action red flag, the
+    # bot cannot legitimately enter regardless of how the rest of the post
+    # reads. Persisting as "no" stops the bot from posting AND from re-
+    # querying the LLM on every tick.
+    matched, phrase = has_off_bot_requirement(text)
+    if matched:
+        log.info(f"classify_giveaway: red-flag phrase {phrase!r} → no")
         return None, "unknown", "no", None
     if not os.environ.get("ANTHROPIC_API_KEY"):
         return None, "unknown", "error", None
