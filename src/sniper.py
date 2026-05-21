@@ -22,6 +22,7 @@ import argparse
 import json
 import logging
 import os
+import random
 import sys
 import time
 from pathlib import Path
@@ -59,6 +60,17 @@ MAX_POSTS_PER_SCAN = 20
 # the post text or brand metadata. Empty list = no filter (current behavior).
 # Set at startup from --filter.
 _FILTER_KEYWORDS: list[str] = []
+
+# Optional pre-POST delay (seconds). When both > 0, the bot sleeps
+# random.uniform(min, max) between the rules-check and the fresh-count gate.
+# Two effects:
+#   1. Bot looks like a fast human (4-9s response) instead of a 1.5s machine.
+#   2. If a real person comments during the delay, fresh-count > 0 triggers
+#      the existing "too late" skip — bot quietly bows out instead of
+#      stomping on a thread where it lost the race a beat earlier.
+# Set at startup from --post-delay-min / --post-delay-max.
+_POST_DELAY_MIN: float = 0.0
+_POST_DELAY_MAX: float = 0.0
 
 # Cap on classify_giveaway() calls per scan tick. The first scan after startup
 # wants to LLM-classify every historical Daniel post (~20 of them) — without a
@@ -342,6 +354,19 @@ def _consider_post(client: WatchlinkClient, post: dict, source: str,
         log.info(f"DRY-RUN: would comment {word!r} on post {post_id}")
         return
 
+    # Optional pre-POST delay. Makes the bot look like a fast human (4-9s
+    # response) rather than a 1.5s machine. Side effect: if a real person
+    # comments during the sleep, the fresh-count gate below will skip the
+    # POST — we'd rather lose the race quietly than be the obvious bot.
+    if _POST_DELAY_MAX > 0 and _POST_DELAY_MIN < _POST_DELAY_MAX:
+        delay = random.uniform(_POST_DELAY_MIN, _POST_DELAY_MAX)
+        log.info(f"DELAY post={post_id} sleeping {delay:.2f}s before POST")
+        time.sleep(delay)
+    elif _POST_DELAY_MAX > 0:
+        # Min == max → fixed delay (e.g., --post-delay-min=5 --post-delay-max=5)
+        log.info(f"DELAY post={post_id} sleeping {_POST_DELAY_MAX:.2f}s before POST")
+        time.sleep(_POST_DELAY_MAX)
+
     # Last-mile check: fresh GET of the comments endpoint. This closes the
     # window between the list payload and our POST. Typically ~100-200ms old.
     try:
@@ -457,10 +482,15 @@ def run_loop(armed: bool, interval: int) -> None:
             return
 
         rules_on = bool(os.environ.get("ANTHROPIC_API_KEY"))
+        if _POST_DELAY_MAX > 0:
+            delay_str = f"{_POST_DELAY_MIN:.1f}-{_POST_DELAY_MAX:.1f}s"
+        else:
+            delay_str = "off"
         log.info(
             f"loop armed={armed} interval={interval}s "
             f"filter={_FILTER_KEYWORDS or 'off'} "
-            f"rules-check={'on' if rules_on else 'off'}"
+            f"rules-check={'on' if rules_on else 'off'} "
+            f"post-delay={delay_str}"
         )
         while True:
             tick_start = time.time()
@@ -521,10 +551,20 @@ def main() -> None:
                          'these space-separated keywords '
                          '(case-insensitive, order-independent). E.g. '
                          '--filter "seiko presage". Omit for no filter.')
+    ap.add_argument("--post-delay-min", type=float, default=0.0,
+                    help='Lower bound on random pre-POST sleep, in seconds. '
+                         'Default 0 (no delay). Combined with --post-delay-max '
+                         'to disguise bot speed as a fast-human response time.')
+    ap.add_argument("--post-delay-max", type=float, default=0.0,
+                    help='Upper bound on random pre-POST sleep, in seconds. '
+                         'Default 0 (no delay). If the bot is too obviously '
+                         'first, try --post-delay-min 4 --post-delay-max 9.')
     args = ap.parse_args()
 
-    global _FILTER_KEYWORDS
+    global _FILTER_KEYWORDS, _POST_DELAY_MIN, _POST_DELAY_MAX
     _FILTER_KEYWORDS = (args.filter or "").split()
+    _POST_DELAY_MIN = max(0.0, args.post_delay_min)
+    _POST_DELAY_MAX = max(_POST_DELAY_MIN, args.post_delay_max)
 
     if args.command == "login":
         force_login()
