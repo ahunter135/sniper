@@ -75,6 +75,13 @@ _FILTER_KEYWORDS: list[str] = []
 _POST_DELAY_MIN: float = 0.0
 _POST_DELAY_MAX: float = 0.0
 
+# When True, the user has affirmed they've completed any earlier off-bot
+# prerequisites Daniel required (e.g., "post on the app today before the
+# drop"). Disables the red-flag regex screen AND instructs the classifier
+# to treat past-tense prerequisites as satisfied. Set via --prereqs-done.
+# Default False — bot stays conservative; user has to opt into the trust.
+_PREREQS_DONE: bool = False
+
 # Cap on classify_giveaway() calls per scan tick. The first scan after startup
 # wants to LLM-classify every historical Daniel post (~20 of them) — without a
 # cap that's an instant 429 cascade that stalls the bot for minutes. With this
@@ -247,7 +254,9 @@ def _consider_post(client: WatchlinkClient, post: dict, source: str,
             kind = "unknown"
         else:
             _llm_calls_this_tick += 1
-            llm_comment, llm_kind, status, llm_line = classify_giveaway(text)
+            llm_comment, llm_kind, status, llm_line = classify_giveaway(
+                text, prereqs_done=_PREREQS_DONE,
+            )
             if status == "no":
                 state["llm_no_giveaway"][post_id] = {
                     "source": source,
@@ -486,7 +495,7 @@ def run_loop(armed: bool, interval: int) -> None:
             f"loop armed={armed} interval={interval}s "
             f"filter={_FILTER_KEYWORDS or 'off'} "
             f"post-delay={delay_str} "
-            f"rules-safety=regex+classifier"
+            f"rules-safety={'classifier-only (prereqs-done!)' if _PREREQS_DONE else 'regex+classifier'}"
         )
         while True:
             tick_start = time.time()
@@ -555,12 +564,20 @@ def main() -> None:
                     help='Upper bound on random pre-POST sleep, in seconds. '
                          'Default 0 (no delay). If the bot is too obviously '
                          'first, try --post-delay-min 4 --post-delay-max 9.')
+    ap.add_argument("--prereqs-done", action="store_true",
+                    help='Affirm that you have manually completed any '
+                         'off-bot prerequisites Daniel posted earlier '
+                         '(e.g., "post on the app today"). Disables the '
+                         'red-flag regex screen and tells the LLM to treat '
+                         'past-tense conditions as satisfied. USE WITH CARE '
+                         'on days you have actually done the prereq.')
     args = ap.parse_args()
 
-    global _FILTER_KEYWORDS, _POST_DELAY_MIN, _POST_DELAY_MAX
+    global _FILTER_KEYWORDS, _POST_DELAY_MIN, _POST_DELAY_MAX, _PREREQS_DONE
     _FILTER_KEYWORDS = (args.filter or "").split()
     _POST_DELAY_MIN = max(0.0, args.post_delay_min)
     _POST_DELAY_MAX = max(_POST_DELAY_MIN, args.post_delay_max)
+    _PREREQS_DONE = args.prereqs_done
 
     if args.command == "login":
         force_login()

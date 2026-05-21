@@ -322,7 +322,9 @@ def is_actionable_by_bot(text: str, intended_comment: str) -> tuple[bool, str]:
     return True, f"unrecognized verdict {verdict!r}; proceeding"
 
 
-def classify_giveaway(text: str) -> tuple[str | None, str, str, str | None]:
+def classify_giveaway(text: str, *,
+                      prereqs_done: bool = False
+                      ) -> tuple[str | None, str, str, str | None]:
     """LLM-driven primary classifier for Daniel's posts.
 
     Decides four things in a single Claude call:
@@ -348,10 +350,16 @@ def classify_giveaway(text: str) -> tuple[str | None, str, str, str | None]:
     # bot cannot legitimately enter regardless of how the rest of the post
     # reads. Persisting as "no" stops the bot from posting AND from re-
     # querying the LLM on every tick.
-    matched, phrase = has_off_bot_requirement(text)
-    if matched:
-        log.info(f"classify_giveaway: red-flag phrase {phrase!r} → no")
-        return None, "unknown", "no", None
+    # The user can override with prereqs_done=True for days where they've
+    # already completed Daniel's earlier prerequisites (e.g., "post on the
+    # app today" → user posted manually → drop post says "comment 'done'
+    # if you posted earlier"). The regex would normally fire on "post on
+    # the app" or similar; the override skips that screen.
+    if not prereqs_done:
+        matched, phrase = has_off_bot_requirement(text)
+        if matched:
+            log.info(f"classify_giveaway: red-flag phrase {phrase!r} → no")
+            return None, "unknown", "no", None
     if not os.environ.get("ANTHROPIC_API_KEY"):
         return None, "unknown", "error", None
 
@@ -444,6 +452,22 @@ def classify_giveaway(text: str) -> tuple[str | None, str, str, str | None]:
         "- Giveaways requiring follows, tags, invites, DMs, reposts, or "
         "external clicks"
     )
+    if prereqs_done:
+        # User has confirmed they handled any earlier prerequisite Daniel
+        # asked for. Tell the LLM to treat past-tense conditions as met.
+        prompt += (
+            "\n\nIMPORTANT CONTEXT: The user has manually completed any "
+            "earlier prerequisites Daniel posted (e.g., 'post on the app "
+            "today before the drop', 'share us with a friend earlier'). "
+            "If this post says something like 'comment X if you've already "
+            "done Y' or 'first to comment X who posted today', treat the "
+            "user's prerequisite as satisfied and answer YES with the "
+            "appropriate comment. Still answer NO if the post requires an "
+            "action that has to happen BETWEEN seeing this post and "
+            "commenting (e.g., 'go message me proof now', 'tag 2 friends "
+            "in your comment', 'send a screenshot to enter')."
+        )
+
     out = _call_claude(prompt, max_tokens=80)
     if out is None:
         return None, "unknown", "error", None
