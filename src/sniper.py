@@ -82,6 +82,33 @@ _POST_DELAY_MAX: float = 0.0
 # Default False — bot stays conservative; user has to opt into the trust.
 _PREREQS_DONE: bool = False
 
+# Allowed watch conditions from the API's `condition` field. Posts whose
+# condition is set and not in this set are skipped before the LLM is
+# called. Posts with no condition field (or condition=None) are assumed
+# to be new and proceed normally. Set via --allow-quality.
+_ALLOWED_QUALITIES: set[str] = {"new", "like_new"}
+
+
+def _normalize_quality(raw: object) -> str | None:
+    """Lowercase + space→underscore. None / empty / non-string → None."""
+    if not isinstance(raw, str):
+        return None
+    s = raw.strip().lower().replace(" ", "_").replace("-", "_")
+    return s or None
+
+
+def _post_meets_quality_bar(post: dict) -> tuple[bool, str | None]:
+    """Returns (passes, normalized_condition).
+
+    Posts with no `condition` field (or condition=None / empty) are
+    assumed to be new and pass. Posts with an explicit condition must
+    match _ALLOWED_QUALITIES (case-insensitive after normalization).
+    """
+    cond = _normalize_quality(post.get("condition"))
+    if cond is None:
+        return True, None  # assume new
+    return cond in _ALLOWED_QUALITIES, cond
+
 # Cap on classify_giveaway() calls per scan tick. The first scan after startup
 # wants to LLM-classify every historical Daniel post (~20 of them) — without a
 # cap that's an instant 429 cascade that stalls the bot for minutes. With this
@@ -129,6 +156,7 @@ def load_state() -> dict:
         "skipped_by_rules": {},
         "llm_no_giveaway": {},
         "skipped_by_filter": {},
+        "skipped_by_quality": {},
     }
     if STATE_FILE.exists():
         loaded = json.loads(STATE_FILE.read_text())
@@ -216,6 +244,31 @@ def _consider_post(client: WatchlinkClient, post: dict, source: str,
         prior_keywords = sorted(prior_filter.get("filter_at_time") or [])
         if prior_keywords == sorted(_FILTER_KEYWORDS):
             return
+    # Previously rejected by quality bar. Same logic — only honour the
+    # persisted skip if the allowed-quality set still matches.
+    prior_q = state.get("skipped_by_quality", {}).get(post_id)
+    if prior_q is not None:
+        prior_allowed = set(prior_q.get("allowed") or [])
+        if prior_allowed == _ALLOWED_QUALITIES:
+            return
+
+    # Quality gate (deterministic, before any LLM call) — skip posts whose
+    # condition field is set to something below the user's bar. Assume
+    # condition=None means new. Persisted so we don't re-evaluate.
+    quality_ok, post_condition = _post_meets_quality_bar(post)
+    if not quality_ok:
+        state["skipped_by_quality"][post_id] = {
+            "condition": post_condition,
+            "allowed": sorted(_ALLOWED_QUALITIES),
+            "source": source,
+            "ts": time.time(),
+        }
+        save_state(state)
+        log.info(
+            f"QUALITY-SKIP post={post_id} condition={post_condition!r} "
+            f"not in allowed={sorted(_ALLOWED_QUALITIES)} — skip"
+        )
+        return
 
     text = extract_text(post)
     is_daniel = _is_daniel_post(post, source)
@@ -494,6 +547,7 @@ def run_loop(armed: bool, interval: int) -> None:
         log.info(
             f"loop armed={armed} interval={interval}s "
             f"filter={_FILTER_KEYWORDS or 'off'} "
+            f"quality={sorted(_ALLOWED_QUALITIES)} "
             f"post-delay={delay_str} "
             f"rules-safety={'classifier-only (prereqs-done!)' if _PREREQS_DONE else 'regex+classifier'}"
         )
@@ -571,13 +625,27 @@ def main() -> None:
                          'red-flag regex screen and tells the LLM to treat '
                          'past-tense conditions as satisfied. USE WITH CARE '
                          'on days you have actually done the prereq.')
+    ap.add_argument("--allow-quality", type=str, default="new,like_new",
+                    help='Comma-separated list of acceptable values for '
+                         'the post `condition` field (case-insensitive). '
+                         'Default "new,like_new". Posts with condition '
+                         'outside this set are skipped before any LLM '
+                         'call. Posts with no condition field are assumed '
+                         'new and pass.')
     args = ap.parse_args()
 
     global _FILTER_KEYWORDS, _POST_DELAY_MIN, _POST_DELAY_MAX, _PREREQS_DONE
+    global _ALLOWED_QUALITIES
     _FILTER_KEYWORDS = (args.filter or "").split()
     _POST_DELAY_MIN = max(0.0, args.post_delay_min)
     _POST_DELAY_MAX = max(_POST_DELAY_MIN, args.post_delay_max)
     _PREREQS_DONE = args.prereqs_done
+    _ALLOWED_QUALITIES = {
+        q for q in (
+            _normalize_quality(part) for part in args.allow_quality.split(",")
+        )
+        if q
+    }
 
     if args.command == "login":
         force_login()
