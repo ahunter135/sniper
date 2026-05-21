@@ -36,7 +36,10 @@ from matcher import (
     find_giveaway_word,
     is_free_giveaway_post,
 )
-from solver import classify_giveaway, is_actionable_by_bot, solve_giveaway
+from solver import classify_giveaway, solve_giveaway
+# is_actionable_by_bot is kept in solver.py for the test suite, but the
+# bot's hot path no longer calls it — rule-check is now folded into
+# classify_giveaway via the regex prefilter + prompt's NO list.
 
 BASE = Path(__file__).resolve().parent.parent
 
@@ -333,22 +336,16 @@ def _consider_post(client: WatchlinkClient, post: dict, source: str,
     }
     save_state(state)
 
-    # LLM rules check. Catches off-bot requirements (invite friends, follow,
-    # repost, etc.) that the local matcher can't reason about. Fail-open if
-    # no API key or the call errors out. Adds ~0.5–2s but only on a match,
-    # not per scan tick.
-    safe, reason = is_actionable_by_bot(text, word)
-    if not safe:
-        state["skipped_by_rules"][post_id] = {
-            "word": word,
-            "reason": reason,
-            "source": source,
-            "ts": time.time(),
-        }
-        save_state(state)
-        log.info(f"RULES-BLOCK post={post_id} word={word!r} — {reason}")
-        return
-    log.info(f"RULES-OK post={post_id} — {reason}")
+    # Rules-check is now layered into the classifier itself:
+    #   Layer 1: has_off_bot_requirement(text) — deterministic regex,
+    #            already ran INSIDE classify_giveaway above and would have
+    #            returned status="no" if any red-flag phrase matched.
+    #   Layer 2: classify_giveaway prompt — explicit NO list covering
+    #            follow / repost / tag / invite / send-proof / before-
+    #            commenting / "post on the app" patterns.
+    # Dropping the separate is_actionable_by_bot() LLM call here halves
+    # the per-match LLM budget (was 2 calls per match, now 1) so we
+    # stay under Anthropic's 5 RPM free-tier cap during a real race.
 
     if not armed:
         log.info(f"DRY-RUN: would comment {word!r} on post {post_id}")
@@ -481,7 +478,6 @@ def run_loop(armed: bool, interval: int) -> None:
             log.exception("initial auth crashed")
             return
 
-        rules_on = bool(os.environ.get("ANTHROPIC_API_KEY"))
         if _POST_DELAY_MAX > 0:
             delay_str = f"{_POST_DELAY_MIN:.1f}-{_POST_DELAY_MAX:.1f}s"
         else:
@@ -489,8 +485,8 @@ def run_loop(armed: bool, interval: int) -> None:
         log.info(
             f"loop armed={armed} interval={interval}s "
             f"filter={_FILTER_KEYWORDS or 'off'} "
-            f"rules-check={'on' if rules_on else 'off'} "
-            f"post-delay={delay_str}"
+            f"post-delay={delay_str} "
+            f"rules-safety=regex+classifier"
         )
         while True:
             tick_start = time.time()

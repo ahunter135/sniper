@@ -30,7 +30,7 @@ log = logging.getLogger("sniper.solver")
 #     SNIPER_LLM_MIN_INTERVAL=2.5   # for build tier (50 RPM)
 # When a call is throttled by this gate, _call_claude returns None
 # immediately — no retry, no wait — so the scan loop stays responsive.
-_LLM_MIN_INTERVAL = float(os.environ.get("SNIPER_LLM_MIN_INTERVAL", "13"))
+_LLM_MIN_INTERVAL = float(os.environ.get("SNIPER_LLM_MIN_INTERVAL", "15"))
 _last_claude_call_ts: float = 0.0
 
 # Model selection. Default Haiku 4.5 (fast, cheap, mostly accurate). Override
@@ -434,6 +434,11 @@ def classify_giveaway(text: str) -> tuple[str | None, str, str, str | None]:
         'Phrasing like "post on the app today", "make a post", "create a '
         'post", "get in your post first", "post first", "make sure you post" '
         "all mean entry requires a NEW TOP-LEVEL post.\n"
+        "- Posts that require ANY off-bot action before commenting. Phrasing "
+        'like "tell somebody about us / about WatchLink", "send me receipts", '
+        '"message me proof", "DM screenshots", "prove that you", "screenshot '
+        'your", "before commenting" all mean the post requires more than '
+        "just a comment.\n"
         "- Opinions, jokes, hype, tattoo pics, just-arrived-in-the-mail posts\n"
         "- Posts about giveaways that have already concluded\n"
         "- Giveaways requiring follows, tags, invites, DMs, reposts, or "
