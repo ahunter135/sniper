@@ -121,10 +121,21 @@ Notepad opens. You'll see:
 ```
 WATCHLINK_EMAIL=you@example.com
 WATCHLINK_PASSWORD=your-password-here
+
+# Optional. If set, the bot will fall back to an Anthropic Haiku call when a
+# Daniel daily deal contains a puzzle the local arithmetic solver can't handle
+# (riddles, word problems, etc.). Leave blank to disable — local math still
+# works without a key.
+ANTHROPIC_API_KEY=
 ```
 
-Replace those two values with your actual Watchlink email and password. Save
-(Ctrl+S) and close Notepad.
+Replace the email and password with your actual Watchlink credentials. The
+`ANTHROPIC_API_KEY` line is **optional** — paste a key from
+<https://console.anthropic.com/> after the `=` if you have one. With a key, the
+bot can also handle riddles and "general giveaway" posts that don't follow the
+classic "first to comment 'X'" wording. Without one, it falls back to the
+local regex matchers and still catches the common cases. Save (Ctrl+S) and
+close Notepad.
 
 > Your password sits on your own machine in `.env`. It is in `.gitignore`, so it
 > never gets pushed back to GitHub. Don't share screenshots of this file.
@@ -187,12 +198,22 @@ python src\sniper.py loop --arm --interval 2
 
 ## Safety gates (why it won't embarrass you)
 
-Before it ever posts a comment, **all four** of these must be true:
+Before it ever posts a comment, **every one of these** must be true:
 
-1. The post text matches a "first to comment / say / reply '<word>'" pattern.
-2. The post's comment count in the feed is 0.
-3. A fresh check immediately before posting still shows 0 comments.
-4. The bot has never posted on this post before (tracked in
+1. **Quality bar.** The post's watch condition is `new` or `like_new` (or
+   missing, which is assumed to mean new). Worn / poor / for-parts listings
+   are skipped without burning an LLM call.
+2. **No off-bot prerequisites.** A built-in red-flag screen blocks posts that
+   require following, reposting, tagging friends, sending proof DMs, "post
+   on the app first," "before commenting," etc. This screen runs without the
+   LLM so it still fires when the LLM is rate-limited.
+3. **It looks like a real giveaway.** Either the local regex matcher finds a
+   "first to comment 'X'" pattern, OR (if `ANTHROPIC_API_KEY` is set) the
+   Claude classifier confirms it's a giveaway and tells the bot what to
+   comment.
+4. **The post's comment count in the feed is 0.**
+5. **A fresh check immediately before posting still shows 0 comments.**
+6. **The bot has never posted on this post before** (tracked in
    `state\seen.json`).
 
 If any one fails, it skips and moves on. It will never double-post and it will
@@ -200,7 +221,51 @@ never jump into a thread that already has comments.
 
 There's also a default for Daniel's "Free Seiko Daily Deal" series: when he
 posts a $0 listing without explicit instructions, the bot comments `"sold"` —
-the community convention for his daily deals.
+the community convention for his daily deals. With an `ANTHROPIC_API_KEY` set,
+the LLM also handles math puzzles, riddles, and free-form "name the model"
+prompts.
+
+---
+
+## Optional tuning (skip on first run)
+
+Once the basic setup works, you can add extra flags to the live command in
+step 8. Combine them however you like.
+
+**Only chase Seiko Presage drops:**
+
+```powershell
+python src\sniper.py loop --arm --interval 2 --filter "seiko presage"
+```
+
+`--filter` only applies to watch giveaways — every keyword (space-separated,
+case-insensitive) has to appear somewhere in the post body, brand metadata,
+or the model name the LLM recognizes. Merch / accessory giveaways still go
+through.
+
+**Look more human (4–9s "thinking" delay before commenting):**
+
+```powershell
+python src\sniper.py loop --arm --interval 2 --post-delay-min 4 --post-delay-max 9
+```
+
+If a real person beats you during the delay, the bot quietly skips that post
+instead of being the obvious 1-second bot.
+
+**You already did today's prereq ("post on the app today"):**
+
+```powershell
+python src\sniper.py loop --arm --interval 2 --prereqs-done
+```
+
+Disables the red-flag screen for past-tense conditions. Use carefully — only
+on days you actually did the prereq.
+
+**Allow used watches too (default is new + like_new):**
+
+```powershell
+python src\sniper.py loop --arm --interval 2 --allow-quality "new,like_new,good"
+```
 
 ---
 

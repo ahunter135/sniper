@@ -56,6 +56,11 @@ STATE_FILE = BASE / "state" / "seen.json"
 # redirect to /tmp so test runs don't pollute the live bot's log.
 LOG_FILE = Path(os.environ.get("SNIPER_LOG_FILE") or (BASE / "logs" / "sniper.log"))
 
+# Both state/ and logs/ are gitignored, so a fresh clone won't have them.
+# Create them before the logging FileHandler / cookie writes touch the paths.
+LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+COOKIES_FILE.parent.mkdir(parents=True, exist_ok=True)
+
 MAX_POSTS_PER_SCAN = 20
 
 # Optional watchlist filter. When non-empty, the bot only posts on a matched
